@@ -100,7 +100,14 @@ impl IpcClient {
     }
 
     pub fn disconnect(&self) {
-        self.inner.lock().expect("IPC client mutex poisoned").socket = None;
+        let mut state = self.inner.lock().expect("IPC client mutex poisoned");
+        state.socket = None;
+        let current_missing = state.socket_path.as_ref().is_none_or(|path| !path.exists());
+        if current_missing {
+            state.socket_path = discovery::discover_socket()
+                .0
+                .or_else(|| self.config.socket_path.clone());
+        }
     }
 
     pub fn call<Q, R>(
@@ -183,11 +190,13 @@ impl IpcClient {
         let response = ApiResponse::decode(&message[..])
             .map_err(|error| IpcError::Codec(error.to_string()))?;
 
-        if let Some(header) = response.header {
-            state.token = header.kicad_token;
+        let response_header = response.header.ok_or(IpcError::MissingResponse)?;
+        let response_token = response_header.kicad_token;
+        if !response_token.is_empty() {
+            state.token = response_token;
         }
 
-        let status = response.status.unwrap_or_default();
+        let status = response.status.ok_or(IpcError::MissingResponse)?;
         let status_code =
             ApiStatusCode::try_from(status.status).unwrap_or(ApiStatusCode::AsUnknown);
         if status_code != ApiStatusCode::AsOk {
@@ -284,6 +293,11 @@ mod tests {
             message: "invalid".to_string(),
         };
         assert!(!error.is_transient());
+        let mismatch = IpcError::Api {
+            status: "AS_TOKEN_MISMATCH".to_string(),
+            message: "rotated".to_string(),
+        };
+        assert!(mismatch.is_transient());
     }
 
     #[test]
@@ -379,7 +393,9 @@ mod tests {
                     .as_slice(),
                 )
                 .unwrap();
-            let _ = listener.recv().unwrap();
+            let retry = listener.recv().unwrap();
+            let retry = ApiRequest::decode(&retry[..]).unwrap();
+            assert_eq!(retry.header.unwrap().kicad_token, "rotated-secret");
             let version = GetVersionResponse {
                 version: Some(KiCadVersion {
                     major: 10,

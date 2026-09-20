@@ -1,6 +1,6 @@
 [package]
 name = "kicad-mcp"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A fast, local-first Model Context Protocol server for KiCad"
@@ -24,6 +24,7 @@ tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "io-std", "
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.18", features = ["v4"] }
+wait-timeout = "0.2"
 
 [build-dependencies]
 prost-build = "0.14"

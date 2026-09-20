@@ -26,7 +26,37 @@ cp README.md LICENSE SECURITY.md "dist/$name/"
 cp plugin/plugin.json "dist/$name/"
 cp docs/CLIENTS.md docs/COMPATIBILITY.md docs/PROTOBUF_PROVENANCE.md "dist/$name/docs/"
 
-tar -C dist -czf "dist/$name.tar.gz" "$name"
+python3 - "$name" <<'PY'
+import gzip
+import pathlib
+import tarfile
+import sys
+
+name = sys.argv[1]
+root = pathlib.Path("dist")
+source = root / name
+archive = root / f"{name}.tar.gz"
+
+with archive.open("wb") as raw:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as output:
+            for path in [source, *sorted(source.rglob("*"), key=lambda item: item.as_posix())]:
+                relative = path.relative_to(root).as_posix()
+                info = output.gettarinfo(str(path), arcname=relative)
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                info.mtime = 0
+                if info.isdir():
+                    info.mode = 0o755
+                    output.addfile(info)
+                elif info.isfile():
+                    executable = path.name in {"kicad-mcp", "kicad-mcp.exe", "run-headless"}
+                    info.mode = 0o755 if executable else 0o644
+                    with path.open("rb") as payload:
+                        output.addfile(info, payload)
+                else:
+                    raise SystemExit(f"unsupported release entry: {path}")
+PY
 if command -v cargo-cyclonedx >/dev/null 2>&1; then
   cargo cyclonedx --format json --override-filename "${name}.cdx"
   mv "${name}.cdx.json" "dist/${name}.cdx.json"

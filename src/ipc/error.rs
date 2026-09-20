@@ -26,7 +26,10 @@ impl IpcError {
                     || message.contains("connection")
             }
             Self::Api { status, .. } => {
-                matches!(status.as_str(), "AS_BUSY" | "AS_NOT_READY" | "AS_TIMEOUT")
+                matches!(
+                    status.as_str(),
+                    "AS_BUSY" | "AS_NOT_READY" | "AS_TIMEOUT" | "AS_TOKEN_MISMATCH"
+                )
             }
             _ => false,
         }

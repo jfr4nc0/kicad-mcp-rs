@@ -33,3 +33,36 @@ jobs:
       - name: Standalone probe
         shell: bash
         run: target/release/kicad-mcp${{ runner.os == 'Windows' && '.exe' || '' }} --probe
+      - name: Clean local install
+        if: runner.os == 'Linux'
+        run: cargo install --path . --locked --root target/ci-install
+      - name: MCP initialization smoke test
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          Path("target/ci-inspector.json").write_text(json.dumps({
+              "mcpServers": {
+                  "kicad": {
+                      "command": str(Path("target/ci-install/bin/kicad-mcp").resolve()),
+                      "args": []
+                  }
+              }
+          }))
+          PY
+          npx --yes @modelcontextprotocol/inspector --cli \
+            --config target/ci-inspector.json --server kicad \
+            --method tools/list --format json > target/ci-tools.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          result = json.loads(Path("target/ci-tools.json").read_text())
+          tools = result.get("tools") or result.get("result", {}).get("tools", [])
+          names = {tool["name"] for tool in tools}
+          required = {"kicad_status", "server_info", "get_board_summary"}
+          missing = sorted(required - names)
+          if missing:
+              raise SystemExit(f"missing MCP tools: {missing}")
+          PY

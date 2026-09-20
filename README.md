@@ -4,7 +4,7 @@ A local-first Model Context Protocol server for KiCad, written in Rust. It talks
 
 ## Status
 
-Version `0.2.0` implements the M0–M6 surface. KiCad 10.0.6 is the primary target. KiCad 11 support is built from a pinned development schema and remains preview until tested against a released KiCad 11 build. See [COMPATIBILITY.md](docs/COMPATIBILITY.md).
+Version `0.2.1` implements the M0–M6 surface and adds post-audit security hardening. KiCad 10.0.6 is the primary target. KiCad 11 support is built from a pinned development schema and remains preview until tested against a released KiCad 11 build. See [COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
 ## Safety model
 
@@ -74,7 +74,8 @@ RUST_LOG=info target/release/kicad-mcp
 | `KICAD_MCP_ALLOW_WRITE` | `false` | Explicit mutation opt-in |
 | `KICAD_MCP_PROJECT_ROOT` | unset | Canonical path allowlist for design and output files |
 | `KICAD_MCP_MAX_PAGE_SIZE` | bounded internal default | Maximum items per page |
-| `KICAD_MCP_MAX_OUTPUT_BYTES` | bounded internal default | Maximum CLI output returned |
+| `KICAD_MCP_MAX_OUTPUT_BYTES` | `65536` | Maximum CLI and MCP response bytes |
+| `KICAD_MCP_CLI_TIMEOUT_SECS` | `120` | Hard timeout for each `kicad-cli` subprocess |
 | `KICAD_CLI` | discovered | Explicit `kicad-cli` path |
 
 Client examples: [CLIENTS.md](docs/CLIENTS.md).

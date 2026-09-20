@@ -1,7 +1,10 @@
 use crate::proto::v11::kiapi::{
     board::jobs::{Board3DFormat, RunBoardJobExport3D},
     common::{
-        commands::PlaceFromLibraryResponse,
+        commands::{
+            BeginCommit as BeginCommitV11, BeginCommitResponse as BeginCommitResponseV11,
+            PlaceFromLibraryResponse,
+        },
         types::{
             ItemHeader as ItemHeaderV11, JobStatus, LibraryIdentifier, RunJobResponse,
             RunJobSettings, Vector2 as Vector2V11,
@@ -50,10 +53,13 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
+    thread,
+    time::Duration,
 };
 use uuid::Uuid;
+use wait_timeout::ChildExt;
 
 const GET_VERSION: &str = "kiapi.common.commands.GetVersion";
 const GET_VERSION_RESPONSE: &str = "kiapi.common.commands.GetVersionResponse";
@@ -97,6 +103,7 @@ pub struct KiCadService {
     pub ipc: IpcClient,
     pub safety: SafetyConfig,
     latest_drc: Arc<Mutex<Option<CheckReport>>>,
+    mutation_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +112,7 @@ pub struct SafetyConfig {
     pub project_root: Option<PathBuf>,
     pub max_page_size: usize,
     pub max_output_bytes: usize,
+    pub cli_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -215,6 +223,7 @@ pub struct SchematicSheetSummary {
     pub filename: String,
     pub page_number: String,
     pub path: String,
+    pub path_ids: Vec<String>,
     pub children: Vec<SchematicSheetSummary>,
 }
 
@@ -246,6 +255,9 @@ impl Default for SafetyConfig {
             max_page_size: env_usize("KICAD_MCP_MAX_PAGE_SIZE", 200).clamp(1, 1_000),
             max_output_bytes: env_usize("KICAD_MCP_MAX_OUTPUT_BYTES", 64 * 1024)
                 .clamp(1_024, 1024 * 1024),
+            cli_timeout: Duration::from_secs(
+                env_usize("KICAD_MCP_CLI_TIMEOUT_SECS", 120).clamp(1, 3_600) as u64,
+            ),
         }
     }
 }
@@ -256,6 +268,7 @@ impl KiCadService {
             ipc: IpcClient::new(IpcConfig::default()),
             safety: SafetyConfig::default(),
             latest_drc: Arc::new(Mutex::new(None)),
+            mutation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -301,7 +314,7 @@ impl KiCadService {
             GET_VERSION_RESPONSE,
             CallPolicy::ReadOnly,
         )?;
-        let version = response.version.unwrap_or_default();
+        let version = response.version.ok_or(IpcError::MissingResponse)?;
         Ok(VersionInfo {
             major: version.major,
             minor: version.minor,
@@ -341,9 +354,11 @@ impl KiCadService {
     }
 
     pub fn active_project(&self) -> Result<DocumentInfo, IpcError> {
-        self.active_board()
-            .or_else(|_| self.active_schematic())
-            .map(|document| Self::document_info(&document))
+        let document = self.active_board().or_else(|_| self.active_schematic())?;
+        if self.safety.project_root.is_some() {
+            self.ensure_document_allowed(&document)?;
+        }
+        Ok(Self::document_info(&document))
     }
 
     pub fn document_info(document: &DocumentSpecifier) -> DocumentInfo {
@@ -362,6 +377,9 @@ impl KiCadService {
 
     pub fn board_summary(&self) -> Result<BoardSummary, IpcError> {
         let document = self.active_board()?;
+        if self.safety.project_root.is_some() {
+            self.ensure_document_allowed(&document)?;
+        }
         let counts = [
             KiCadObjectType::KotPcbFootprint,
             KiCadObjectType::KotPcbTrace,
@@ -415,6 +433,7 @@ impl KiCadService {
             GET_ITEMS_RESPONSE,
             CallPolicy::ReadOnly,
         )?;
+        validate_item_request_status(response.status)?;
         let item = response.items.first().ok_or(IpcError::Api {
             status: "ITEM_NOT_FOUND".to_string(),
             message: format!("footprint {id} was not found"),
@@ -461,8 +480,10 @@ impl KiCadService {
         expected_revision: &str,
         dry_run: bool,
     ) -> Result<MutationReceipt, IpcError> {
+        let _guard = self.lock_mutation()?;
         self.require_write()?;
         let document = self.active_board()?;
+        self.ensure_document_allowed(&document)?;
         let current_any = self.get_item_any(&document, id)?;
         let before = revision(&current_any.value);
         if before != expected_revision {
@@ -474,7 +495,7 @@ impl KiCadService {
             footprint.orientation = Some(Angle { value_degrees });
         }
         let updated_any = pack(FOOTPRINT_TYPE, &footprint);
-        let after = revision(&updated_any.value);
+        let mut after = revision(&updated_any.value);
         if dry_run {
             return Ok(MutationReceipt {
                 operation: "move_footprint".to_string(),
@@ -486,11 +507,12 @@ impl KiCadService {
             });
         }
         self.update_items(
-            document,
+            document.clone(),
             vec![updated_any],
             vec!["position".to_string(), "orientation".to_string()],
             "Move footprint from MCP",
         )?;
+        after = revision(&self.get_item_any(&document, id)?.value);
         Ok(MutationReceipt {
             operation: "move_footprint".to_string(),
             affected_ids: vec![id.to_string()],
@@ -509,8 +531,10 @@ impl KiCadService {
         expected_revision: &str,
         dry_run: bool,
     ) -> Result<MutationReceipt, IpcError> {
+        let _guard = self.lock_mutation()?;
         self.require_write()?;
         let document = self.active_board()?;
+        self.ensure_document_allowed(&document)?;
         let current_any = self.get_item_any(&document, id)?;
         let before = revision(&current_any.value);
         if before != expected_revision {
@@ -545,14 +569,15 @@ impl KiCadService {
         text.text = value.to_string();
 
         let updated_any = pack(FOOTPRINT_TYPE, &footprint);
-        let after = revision(&updated_any.value);
+        let mut after = revision(&updated_any.value);
         if !dry_run {
             self.update_items(
-                document,
+                document.clone(),
                 vec![updated_any],
                 vec![format!("{property}_field")],
                 "Update footprint property from MCP",
             )?;
+            after = revision(&self.get_item_any(&document, id)?.value);
         }
         Ok(MutationReceipt {
             operation: "set_footprint_property".to_string(),
@@ -574,10 +599,12 @@ impl KiCadService {
         net_name: String,
         dry_run: bool,
     ) -> Result<MutationReceipt, IpcError> {
+        let _guard = self.lock_mutation()?;
         self.require_write()?;
         validate_positive("width_nm", width_nm)?;
         BoardLayer::try_from(layer).map_err(|_| invalid("layer", layer))?;
         let document = self.active_board()?;
+        self.ensure_document_allowed(&document)?;
         let track = Track {
             id: None,
             start: Some(start.into()),
@@ -632,10 +659,12 @@ impl KiCadService {
         expected_revision: &str,
         dry_run: bool,
     ) -> Result<MutationReceipt, IpcError> {
+        let _guard = self.lock_mutation()?;
         self.require_write()?;
         validate_positive("width_nm", width_nm)?;
         BoardLayer::try_from(layer).map_err(|_| invalid("layer", layer))?;
         let document = self.active_board()?;
+        self.ensure_document_allowed(&document)?;
         let current_any = self.get_item_any(&document, id)?;
         let before = revision(&current_any.value);
         if before != expected_revision {
@@ -651,10 +680,10 @@ impl KiCadService {
             name: net_name,
         });
         let packed = pack(TRACK_TYPE, &track);
-        let after = revision(&packed.value);
+        let mut after = revision(&packed.value);
         if !dry_run {
             self.update_items(
-                document,
+                document.clone(),
                 vec![packed],
                 vec![
                     "start".to_string(),
@@ -665,6 +694,7 @@ impl KiCadService {
                 ],
                 "Update track from MCP",
             )?;
+            after = revision(&self.get_item_any(&document, id)?.value);
         }
         Ok(MutationReceipt {
             operation: "update_track".to_string(),
@@ -687,6 +717,7 @@ impl KiCadService {
         net_name: String,
         dry_run: bool,
     ) -> Result<MutationReceipt, IpcError> {
+        let _guard = self.lock_mutation()?;
         self.require_write()?;
         validate_positive("diameter_nm", diameter_nm)?;
         validate_positive("drill_nm", drill_nm)?;
@@ -696,6 +727,8 @@ impl KiCadService {
                 message: "drill_nm must be smaller than diameter_nm".to_string(),
             });
         }
+        let document = self.active_board()?;
+        self.ensure_document_allowed(&document)?;
         let layers = vec![start_layer, end_layer];
         for layer in &layers {
             BoardLayer::try_from(*layer).map_err(|_| invalid("layer", *layer))?;
@@ -764,7 +797,6 @@ impl KiCadService {
                 saved: false,
             });
         }
-        let document = self.active_board()?;
         let created = self.create_items(document.clone(), vec![packed], "Create via from MCP")?;
         let after_revision = created
             .first()
@@ -789,15 +821,17 @@ impl KiCadService {
         expected_revision: &str,
         dry_run: bool,
     ) -> Result<MutationReceipt, IpcError> {
+        let _guard = self.lock_mutation()?;
         self.require_write()?;
         let document = self.active_board()?;
+        self.ensure_document_allowed(&document)?;
         let current = self.get_item_any(&document, id)?;
         let before = revision(&current.value);
         if before != expected_revision {
             return Err(conflict(expected_revision, &before));
         }
         if !dry_run {
-            let commit = self.begin_commit()?;
+            let commit = self.begin_commit(&document)?;
             let result: Result<DeleteItemsResponse, IpcError> = self
                 .ipc
                 .call(
@@ -826,8 +860,10 @@ impl KiCadService {
     }
 
     pub fn save_active_board(&self) -> Result<MutationReceipt, IpcError> {
+        let _guard = self.lock_mutation()?;
         self.require_write()?;
         let document = self.active_board()?;
+        self.ensure_document_allowed(&document)?;
         let _: () = self.ipc.call(
             &SaveDocument {
                 document: Some(document),
@@ -910,10 +946,11 @@ impl KiCadService {
             SCHEMATIC_HIERARCHY_RESPONSE,
             CallPolicy::ReadOnly,
         )?;
+        let mut remaining = self.safety.max_page_size;
         Ok(response
             .top_level_sheets
             .iter()
-            .map(summarize_sheet)
+            .filter_map(|sheet| summarize_sheet_bounded(sheet, &mut remaining))
             .collect())
     }
 
@@ -958,8 +995,10 @@ impl KiCadService {
         position: Point,
         orientation: Option<i32>,
         reference: Option<String>,
+        sheet_path_ids: Option<Vec<String>>,
         dry_run: bool,
     ) -> Result<MutationReceipt, IpcError> {
+        let _guard = self.lock_mutation()?;
         self.require_kicad_11()?;
         self.require_write()?;
         if let Some(value) = orientation {
@@ -967,10 +1006,30 @@ impl KiCadService {
                 .map_err(|_| invalid("orientation", value))?;
         }
         let document_v10 = self.active_schematic()?;
-        let document = crate::proto::v11::kiapi::common::types::DocumentSpecifier::decode(
+        self.ensure_document_allowed(&document_v10)?;
+        let mut document = crate::proto::v11::kiapi::common::types::DocumentSpecifier::decode(
             document_v10.encode_to_vec().as_slice(),
         )
         .map_err(|error| IpcError::Codec(error.to_string()))?;
+        if let Some(path_ids) = sheet_path_ids {
+            if path_ids.is_empty() || path_ids.iter().any(String::is_empty) {
+                return Err(IpcError::Api {
+                    status: "INVALID_SHEET_PATH".to_string(),
+                    message: "sheet_path_ids must contain one or more non-empty KIIDs".to_string(),
+                });
+            }
+            document.identifier = Some(
+                crate::proto::v11::kiapi::common::types::document_specifier::Identifier::SheetPath(
+                    crate::proto::v11::kiapi::common::types::SheetPath {
+                        path: path_ids
+                            .into_iter()
+                            .map(|value| crate::proto::v11::kiapi::common::types::Kiid { value })
+                            .collect(),
+                        path_human_readable: String::new(),
+                    },
+                ),
+            );
+        }
         if dry_run {
             return Ok(MutationReceipt {
                 operation: "place_symbol".to_string(),
@@ -1020,8 +1079,9 @@ impl KiCadService {
 
     pub fn native_export_step(&self, output: &Path) -> Result<NativeJobReceipt, IpcError> {
         self.require_kicad_11()?;
-        self.ensure_allowed_output(output)?;
+        let (output, staged_output) = self.staged_output(output)?;
         let document_v10 = self.active_board()?;
+        self.ensure_document_allowed(&document_v10)?;
         let document = crate::proto::v11::kiapi::common::types::DocumentSpecifier::decode(
             document_v10.encode_to_vec().as_slice(),
         )
@@ -1030,7 +1090,7 @@ impl KiCadService {
             &RunBoardJobExport3D {
                 job_settings: Some(RunJobSettings {
                     document: Some(document),
-                    output_path: output.display().to_string(),
+                    output_path: staged_output.display().to_string(),
                 }),
                 format: Board3DFormat::B3dStep as i32,
                 overwrite: false,
@@ -1048,11 +1108,21 @@ impl KiCadService {
             RUN_JOB_RESPONSE,
             CallPolicy::Mutation,
         )?;
+        let status = JobStatus::try_from(response.status).map_err(|_| IpcError::Api {
+            status: "INVALID_JOB_STATUS".to_string(),
+            message: format!("unknown KiCad job status {}", response.status),
+        })?;
+        if matches!(status, JobStatus::JsError | JobStatus::JsUnspecified) {
+            let _ = remove_output_path(&staged_output);
+            return Err(IpcError::Api {
+                status: status.as_str_name().to_string(),
+                message: response.message,
+            });
+        }
+        self.publish_staged_output(&staged_output, &output)?;
         Ok(NativeJobReceipt {
-            status: JobStatus::try_from(response.status)
-                .map(|status| status.as_str_name().to_string())
-                .unwrap_or_else(|_| "JS_UNSPECIFIED".to_string()),
-            output_paths: response.output_path,
+            status: status.as_str_name().to_string(),
+            output_paths: vec![output.display().to_string()],
             message: response.message,
         })
     }
@@ -1061,7 +1131,7 @@ impl KiCadService {
         let document = self.active_board()?;
         let board = board_path(&document)?;
         self.ensure_allowed(&board)?;
-        self.ensure_allowed_output(output)?;
+        let (output, staged_output) = self.staged_output(output)?;
         let subcommand = match format {
             "gerbers" => "gerbers",
             "pdf" => "pdf",
@@ -1076,17 +1146,48 @@ impl KiCadService {
             }
         };
         let cli = self.kicad_cli_path()?;
-        self.run_check(
-            cli,
-            vec![
-                "pcb".to_string(),
-                "export".to_string(),
-                subcommand.to_string(),
-                "--output".to_string(),
-                output.display().to_string(),
-                board.display().to_string(),
-            ],
-        )
+        let mut arguments = vec![
+            "pcb".to_string(),
+            "export".to_string(),
+            subcommand.to_string(),
+            "--output".to_string(),
+            staged_output.display().to_string(),
+        ];
+        if matches!(format, "pdf" | "svg") {
+            arguments.extend([
+                "--layers".to_string(),
+                "F.Cu,B.Cu,F.Silkscreen,B.Silkscreen,Edge.Cuts".to_string(),
+                if format == "svg" {
+                    "--mode-single".to_string()
+                } else {
+                    "--mode-multipage".to_string()
+                },
+            ]);
+        }
+        arguments.push(board.display().to_string());
+        let mut report = self.run_check(cli, arguments)?;
+        if report.exit_code != 0 {
+            let _ = remove_output_path(&staged_output);
+            return Err(IpcError::Api {
+                status: "CLI_FAILED".to_string(),
+                message: format!(
+                    "kicad-cli export exited with {}: {}",
+                    report.exit_code, report.report
+                ),
+            });
+        }
+        self.publish_staged_output(&staged_output, &output)?;
+        let staged_text = staged_output.to_string_lossy();
+        let output_text = output.to_string_lossy();
+        report.report = report
+            .report
+            .replace(staged_text.as_ref(), output_text.as_ref());
+        for argument in &mut report.command {
+            if argument == staged_text.as_ref() {
+                *argument = output_text.to_string();
+            }
+        }
+        Ok(report)
     }
 
     fn get_items(&self, document: &DocumentSpecifier, types: &[i32]) -> Result<Vec<Any>, IpcError> {
@@ -1099,6 +1200,7 @@ impl KiCadService {
             GET_ITEMS_RESPONSE,
             CallPolicy::ReadOnly,
         )?;
+        validate_item_request_status(response.status)?;
         Ok(response.items)
     }
 
@@ -1114,6 +1216,7 @@ impl KiCadService {
             GET_ITEMS_RESPONSE,
             CallPolicy::ReadOnly,
         )?;
+        validate_item_request_status(response.status)?;
         response.items.into_iter().next().ok_or(IpcError::Api {
             status: "ITEM_NOT_FOUND".to_string(),
             message: format!("item {id} was not found"),
@@ -1133,7 +1236,29 @@ impl KiCadService {
         Ok(response.nets)
     }
 
-    fn begin_commit(&self) -> Result<Kiid, IpcError> {
+    fn begin_commit(&self, document: &DocumentSpecifier) -> Result<Kiid, IpcError> {
+        if self.version()?.major >= 11 {
+            let document_v11 = crate::proto::v11::kiapi::common::types::DocumentSpecifier::decode(
+                document.encode_to_vec().as_slice(),
+            )
+            .map_err(|error| IpcError::Codec(error.to_string()))?;
+            let response: BeginCommitResponseV11 = self.ipc.call(
+                &BeginCommitV11 {
+                    header: Some(ItemHeaderV11 {
+                        document: Some(document_v11),
+                        container: None,
+                        field_mask: None,
+                    }),
+                },
+                BEGIN_COMMIT,
+                BEGIN_COMMIT_RESPONSE,
+                CallPolicy::Mutation,
+            )?;
+            return response
+                .id
+                .map(|id| Kiid { value: id.value })
+                .ok_or(IpcError::MissingResponse);
+        }
         let response: BeginCommitResponse = self.ipc.call(
             &BeginCommit {},
             BEGIN_COMMIT,
@@ -1167,7 +1292,7 @@ impl KiCadService {
         items: Vec<Any>,
         message: &str,
     ) -> Result<Vec<String>, IpcError> {
-        let commit = self.begin_commit()?;
+        let commit = self.begin_commit(&document)?;
         let result: Result<CreateItemsResponse, IpcError> = self
             .ipc
             .call(
@@ -1202,7 +1327,7 @@ impl KiCadService {
         fields: Vec<String>,
         message: &str,
     ) -> Result<UpdateItemsResponse, IpcError> {
-        let commit = self.begin_commit()?;
+        let commit = self.begin_commit(&document)?;
         let result = self
             .ipc
             .call(
@@ -1217,6 +1342,27 @@ impl KiCadService {
             .and_then(validate_update_response);
         self.finish_commit(commit, result.is_ok(), message)?;
         result
+    }
+
+    fn lock_mutation(&self) -> Result<std::sync::MutexGuard<'_, ()>, IpcError> {
+        self.mutation_lock.lock().map_err(|_| IpcError::Api {
+            status: "INTERNAL_STATE".to_string(),
+            message: "mutation workflow lock is poisoned; restart the MCP server".to_string(),
+        })
+    }
+
+    fn ensure_document_allowed(&self, document: &DocumentSpecifier) -> Result<(), IpcError> {
+        let path = match DocumentType::try_from(document.r#type) {
+            Ok(DocumentType::DoctypePcb) => board_path(document)?,
+            Ok(DocumentType::DoctypeSchematic) => schematic_path(document)?,
+            _ => {
+                return Err(IpcError::Api {
+                    status: "UNSUPPORTED_DOCUMENT".to_string(),
+                    message: "only PCB and schematic documents can be mutated".to_string(),
+                });
+            }
+        };
+        self.ensure_allowed(&path)
     }
 
     fn require_write(&self) -> Result<(), IpcError> {
@@ -1269,9 +1415,60 @@ impl KiCadService {
         }
     }
 
-    fn ensure_allowed_output(&self, path: &Path) -> Result<(), IpcError> {
+    fn ensure_allowed_output(&self, path: &Path) -> Result<PathBuf, IpcError> {
+        let file_name = path.file_name().ok_or(IpcError::Api {
+            status: "INVALID_OUTPUT_PATH".to_string(),
+            message: "output path must include a filename".to_string(),
+        })?;
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        self.ensure_allowed(parent)
+        let canonical_parent = parent.canonicalize().map_err(|error| IpcError::Api {
+            status: "PATH_NOT_FOUND".to_string(),
+            message: error.to_string(),
+        })?;
+        self.ensure_allowed(&canonical_parent)?;
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            let status = if metadata.file_type().is_symlink() {
+                "OUTPUT_SYMLINK_REJECTED"
+            } else {
+                "OUTPUT_EXISTS"
+            };
+            return Err(IpcError::Api {
+                status: status.to_string(),
+                message: format!("refusing to overwrite existing output {}", path.display()),
+            });
+        }
+        Ok(canonical_parent.join(file_name))
+    }
+
+    fn staged_output(&self, path: &Path) -> Result<(PathBuf, PathBuf), IpcError> {
+        let final_path = self.ensure_allowed_output(path)?;
+        let file_name = final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(IpcError::Api {
+                status: "INVALID_OUTPUT_PATH".to_string(),
+                message: "output filename must be valid UTF-8".to_string(),
+            })?;
+        let staged =
+            final_path.with_file_name(format!(".kicad-mcp-{}-{file_name}", Uuid::new_v4()));
+        Ok((final_path, staged))
+    }
+
+    fn publish_staged_output(&self, staged: &Path, final_path: &Path) -> Result<(), IpcError> {
+        let metadata = fs::symlink_metadata(staged).map_err(|error| IpcError::Api {
+            status: "OUTPUT_MISSING".to_string(),
+            message: format!("export did not create {}: {error}", staged.display()),
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(IpcError::Api {
+                status: "OUTPUT_SYMLINK_REJECTED".to_string(),
+                message: "export unexpectedly produced a symlink".to_string(),
+            });
+        }
+        fs::rename(staged, final_path).map_err(|error| IpcError::Api {
+            status: "OUTPUT_PUBLISH_FAILED".to_string(),
+            message: error.to_string(),
+        })
     }
 
     fn kicad_cli_path(&self) -> Result<PathBuf, IpcError> {
@@ -1333,28 +1530,93 @@ impl KiCadService {
         executable: PathBuf,
         arguments: Vec<String>,
     ) -> Result<CheckReport, IpcError> {
-        let output = Command::new(&executable)
+        let mut child = Command::new(&executable)
             .args(&arguments)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|error| IpcError::Transport(error.to_string()))?;
-        let mut report = String::from_utf8_lossy(&output.stdout).into_owned();
-        if !output.stderr.is_empty() {
+        let stdout = child.stdout.take().ok_or(IpcError::MissingResponse)?;
+        let stderr = child.stderr.take().ok_or(IpcError::MissingResponse)?;
+        let stdout_reader = read_bounded(stdout, self.safety.max_output_bytes);
+        let stderr_reader = read_bounded(stderr, self.safety.max_output_bytes);
+        let status = match child
+            .wait_timeout(self.safety.cli_timeout)
+            .map_err(|error| IpcError::Transport(error.to_string()))?
+        {
+            Some(status) => status,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(IpcError::Api {
+                    status: "CLI_TIMEOUT".to_string(),
+                    message: format!(
+                        "kicad-cli exceeded the {} second limit",
+                        self.safety.cli_timeout.as_secs()
+                    ),
+                });
+            }
+        };
+        let stdout = stdout_reader.join().map_err(|_| IpcError::Api {
+            status: "INTERNAL_STATE".to_string(),
+            message: "stdout reader thread panicked".to_string(),
+        })?;
+        let stderr = stderr_reader.join().map_err(|_| IpcError::Api {
+            status: "INTERNAL_STATE".to_string(),
+            message: "stderr reader thread panicked".to_string(),
+        })?;
+        let total_len = stdout.len().saturating_add(stderr.len());
+        let mut report = String::from_utf8_lossy(&stdout).into_owned();
+        if !stderr.is_empty() {
             report.push('\n');
-            report.push_str(&String::from_utf8_lossy(&output.stderr));
+            report.push_str(&String::from_utf8_lossy(&stderr));
         }
-        let truncated = report.len() > self.safety.max_output_bytes;
+        let truncated = total_len > self.safety.max_output_bytes;
         if truncated {
-            report.truncate(self.safety.max_output_bytes);
+            let mut boundary = self.safety.max_output_bytes.min(report.len());
+            while !report.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            report.truncate(boundary);
         }
         let mut command = vec![executable.display().to_string()];
         command.extend(arguments);
         Ok(CheckReport {
             command,
-            exit_code: output.status.code().unwrap_or(-1),
+            exit_code: status.code().unwrap_or(-1),
             report,
             truncated,
         })
     }
+}
+
+fn remove_output_path(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_bounded<R: Read + Send + 'static>(
+    mut reader: R,
+    max_bytes: usize,
+) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut kept = Vec::with_capacity(max_bytes.min(64 * 1024));
+        let mut buffer = [0_u8; 8 * 1024];
+        while let Ok(count) = reader.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            let remaining = max_bytes.saturating_add(1).saturating_sub(kept.len());
+            kept.extend_from_slice(&buffer[..count.min(remaining)]);
+        }
+        kept
+    })
 }
 
 impl From<Point> for Vector2 {
@@ -1366,8 +1628,15 @@ impl From<Point> for Vector2 {
     }
 }
 
-fn summarize_sheet(sheet: &SheetInstance) -> SchematicSheetSummary {
-    SchematicSheetSummary {
+fn summarize_sheet_bounded(
+    sheet: &SheetInstance,
+    remaining: &mut usize,
+) -> Option<SchematicSheetSummary> {
+    if *remaining == 0 {
+        return None;
+    }
+    *remaining -= 1;
+    Some(SchematicSheetSummary {
         name: sheet.name.clone(),
         filename: sheet.filename.clone(),
         page_number: sheet.page_number.clone(),
@@ -1376,8 +1645,17 @@ fn summarize_sheet(sheet: &SheetInstance) -> SchematicSheetSummary {
             .as_ref()
             .map(|path| path.path_human_readable.clone())
             .unwrap_or_default(),
-        children: sheet.children.iter().map(summarize_sheet).collect(),
-    }
+        path_ids: sheet
+            .path
+            .as_ref()
+            .map(|path| path.path.iter().map(|id| id.value.clone()).collect())
+            .unwrap_or_default(),
+        children: sheet
+            .children
+            .iter()
+            .filter_map(|child| summarize_sheet_bounded(child, remaining))
+            .collect(),
+    })
 }
 
 fn capabilities_for(version: &VersionInfo, write_enabled: bool) -> Capabilities {
@@ -1703,6 +1981,30 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cli_execution_is_killed_after_timeout() {
+        let service = KiCadService {
+            ipc: IpcClient::new(IpcConfig::default()),
+            safety: SafetyConfig {
+                write_enabled: false,
+                project_root: None,
+                max_page_size: 200,
+                max_output_bytes: 1024,
+                cli_timeout: Duration::from_millis(20),
+            },
+            latest_drc: Arc::new(Mutex::new(None)),
+            mutation_lock: Arc::new(Mutex::new(())),
+        };
+        let error = service
+            .run_check(PathBuf::from("/bin/sleep"), vec!["1".to_string()])
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            IpcError::Api { status, .. } if status == "CLI_TIMEOUT"
+        ));
+    }
+
     #[test]
     fn write_requires_explicit_opt_in_and_root() {
         let service = KiCadService {
@@ -1712,8 +2014,10 @@ mod tests {
                 project_root: None,
                 max_page_size: 200,
                 max_output_bytes: 1024,
+                cli_timeout: Duration::from_secs(10),
             },
             latest_drc: Arc::new(Mutex::new(None)),
+            mutation_lock: Arc::new(Mutex::new(())),
         };
         assert!(service.require_write().is_err());
     }
@@ -1738,11 +2042,37 @@ mod tests {
                 project_root: Some(root.path().canonicalize().unwrap()),
                 max_page_size: 200,
                 max_output_bytes: 1024,
+                cli_timeout: Duration::from_secs(10),
             },
             latest_drc: Arc::new(Mutex::new(None)),
+            mutation_lock: Arc::new(Mutex::new(())),
         };
         assert!(service.ensure_allowed(&inside_file).is_ok());
         assert!(service.ensure_allowed(&outside_file).is_err());
         assert!(service.ensure_allowed(&escape).is_err());
+        assert!(service.ensure_allowed_output(&escape).is_err());
+
+        let final_output = root.path().join("artifact.step");
+        let (canonical_output, staged_output) = service.staged_output(&final_output).unwrap();
+        fs::write(&staged_output, b"artifact").unwrap();
+        service
+            .publish_staged_output(&staged_output, &canonical_output)
+            .unwrap();
+        assert_eq!(fs::read(&final_output).unwrap(), b"artifact");
+        assert!(service.ensure_allowed_output(&final_output).is_err());
+
+        let outside_document = DocumentSpecifier {
+            r#type: DocumentType::DoctypePcb as i32,
+            project: Some(crate::proto::v10::kiapi::common::types::ProjectSpecifier {
+                name: "outside".to_string(),
+                path: outside.path().display().to_string(),
+            }),
+            identifier: Some(
+                crate::proto::v10::kiapi::common::types::document_specifier::Identifier::BoardFilename(
+                    "outside.kicad_pcb".to_string(),
+                ),
+            ),
+        };
+        assert!(service.ensure_document_allowed(&outside_document).is_err());
     }
 }

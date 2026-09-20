@@ -49,17 +49,18 @@ Status: implemented and MCP-Inspector verified.
 
 Resources cover connection status, board summary, latest DRC, project metadata, capabilities, and safety policy. KiCad 11 schematic resources are version-gated.
 
-Prompts implement inspect, guarded-change, and validation workflows. They preserve write opt-in, dry-run, revision, DRC/ERC, and explicit-save requirements.
+Prompts implement inspect, guarded-change, validation, footprint-placement review, routing review, and manufacturing-preflight workflows. They preserve write opt-in, dry-run, revision, DRC/ERC, and explicit-save requirements.
 
 ## M5 — Packaging and compatibility
 
-Status: implemented; cross-platform jobs await execution on GitHub Actions.
+Status: implemented and verified by GitHub Actions on Linux, macOS ARM64, and Windows MSVC.
 
 - Linux/macOS/Windows CI and release matrices.
 - Native archives, CycloneDX SBOMs, SHA-256 checksums, and GitHub provenance attestations.
 - KiCad executable plugin manifest validated against official schema v1.
 - Compatibility matrix and Hermes, Claude Desktop, VS Code/Copilot, and Inspector examples.
 - Packaged binary standalone probe.
+- Reproducible normalized archives and a clean-install MCP initialization smoke test.
 
 ## M6 — KiCad 11 expansion
 
@@ -67,7 +68,7 @@ Status: implementation complete against pinned development schemas; live accepta
 
 - Separate v10/v11 generated namespaces.
 - Version-gated schematic hierarchy and netlist.
-- Version-gated symbol placement mutation.
+- Version-gated symbol placement mutation with explicit hierarchy `path_ids` targeting.
 - Version-gated native STEP export job.
 - Headless-compatible socket configuration and standalone probe.
 - ERC with a separate committed schematic fixture suite.

@@ -5,9 +5,9 @@
 | 9.x | Not tested | Not tested | CLI only | No | No | Unsupported |
 | 10.0.6 | Yes | Yes, opt-in | `kicad-cli` | No | No | Primary target |
 | 10.x other | Expected | Expected | `kicad-cli` | No | No | Best effort |
-| 11 preview | Yes | Yes, opt-in | CLI + native STEP job | Hierarchy, nets, symbol placement | STEP | Preview |
+| 11 preview | Compiles; not live-tested | Compiles; not live-tested | CLI + native STEP job; not live-tested | Hierarchy, nets, symbol placement; not live-tested | STEP; not live-tested | Preview |
 
-KiCad 10 and earlier require a running GUI. KiCad 11-only tools are removed from `tools/list` unless the server detects a connected KiCad major version of at least 11 at startup. Restart the MCP server after changing the connected KiCad instance.
+KiCad 10 and earlier require a running GUI. KiCad 11-only tools are recomputed for every `tools/list`/tool lookup and remain hidden unless the server currently detects a connected KiCad major version of at least 11. Tool execution also enforces the same runtime version gate.
 
 Platform transport:
 

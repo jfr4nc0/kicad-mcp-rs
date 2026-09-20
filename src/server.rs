@@ -126,6 +126,10 @@ struct PlaceSymbolRequest {
     orientation: Option<i32>,
     #[serde(default)]
     reference: Option<String>,
+    /// Canonical sheet KIID chain returned as `path_ids` by `schematic_hierarchy`.
+    /// If omitted, KiCad's currently active sheet is used.
+    #[serde(default)]
+    sheet_path_ids: Option<Vec<String>>,
     #[serde(default = "default_dry_run")]
     dry_run: bool,
 }
@@ -154,8 +158,16 @@ pub struct KicadMcp {
 impl KicadMcp {
     pub fn new() -> Self {
         let kicad = KiCadService::from_env();
-        let mut tool_router = Self::tool_router();
-        if kicad
+        Self {
+            tool_router: Self::tool_router(),
+            kicad,
+        }
+    }
+
+    fn current_tool_router(&self) -> ToolRouter<Self> {
+        let mut tool_router = self.tool_router.clone();
+        if self
+            .kicad
             .status()
             .version
             .is_none_or(|version| version.major < 11)
@@ -169,7 +181,7 @@ impl KicadMcp {
                 tool_router.disable_route(name.to_string());
             }
         }
-        Self { tool_router, kicad }
+        tool_router
     }
 }
 
@@ -190,7 +202,12 @@ impl KicadMcp {
             "name": env!("CARGO_PKG_NAME"),
             "version": env!("CARGO_PKG_VERSION"),
             "transport": "stdio",
-            "milestones": ["M0", "M1", "M2", "M3", "M4", "M5", "M6"],
+            "milestones_implemented": ["M0", "M1", "M2", "M3", "M4", "M5", "M6"],
+            "verified": {
+                "kicad_10_0_6_live": true,
+                "kicad_11_live": false,
+                "kicad_11_contract": "preview schemas; runtime-gated"
+            },
             "ipc": "KiCad Protobuf over NNG REQ0",
             "writes": "disabled unless KICAD_MCP_ALLOW_WRITE=true and KICAD_MCP_PROJECT_ROOT is set",
             "save_policy": "explicit only"
@@ -405,6 +422,7 @@ impl KicadMcp {
             },
             request.orientation,
             request.reference,
+            request.sheet_path_ids,
             request.dry_run,
         ))
     }
@@ -435,7 +453,7 @@ impl KicadMcp {
     }
 }
 
-#[tool_handler(router = self.tool_router)]
+#[tool_handler(router = self.current_tool_router())]
 impl ServerHandler for KicadMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(
@@ -562,6 +580,21 @@ impl ServerHandler for KicadMcp {
                 Some("Run DRC/ERC and summarize actionable findings"),
                 None,
             ),
+            Prompt::new(
+                "review-footprint-placement",
+                Some("Review PCB footprint placement without changing it"),
+                None,
+            ),
+            Prompt::new(
+                "review-routing",
+                Some("Review tracks, vias, nets, and DRC routing findings"),
+                None,
+            ),
+            Prompt::new(
+                "manufacturing-preflight",
+                Some("Perform a read-only manufacturing preflight"),
+                None,
+            ),
         ];
         if self
             .kicad
@@ -593,6 +626,9 @@ impl ServerHandler for KicadMcp {
             "inspect-board" => INSPECT_BOARD_PROMPT.to_string(),
             "safe-board-change" => SAFE_CHANGE_PROMPT.replace("{goal}", goal),
             "validate-design" => VALIDATE_DESIGN_PROMPT.to_string(),
+            "review-footprint-placement" => FOOTPRINT_PLACEMENT_PROMPT.to_string(),
+            "review-routing" => ROUTING_REVIEW_PROMPT.to_string(),
+            "manufacturing-preflight" => MANUFACTURING_PREFLIGHT_PROMPT.to_string(),
             "inspect-schematic" => INSPECT_SCHEMATIC_PROMPT.to_string(),
             _ => {
                 return std::future::ready(Err(ErrorData::invalid_params(
@@ -620,7 +656,10 @@ const SAFETY_POLICY: &str = r#"# KiCad MCP safety policy
 const INSPECT_BOARD_PROMPT: &str = "Inspect the active PCB without changing it. First call kicad_status, then get_board_summary, list_footprints, list_nets, and get_selection as relevant. Paginate rather than requesting unbounded output. Report measured facts separately from recommendations.";
 const SAFE_CHANGE_PROMPT: &str = "Safely implement this PCB goal: {goal}. Read the affected items and capture their revision hashes. Explain the intended change, call mutation tools in dry-run mode first, then apply only with the same revision if writes are enabled. Run DRC after changes. Do not save unless the user explicitly requested persistence.";
 const VALIDATE_DESIGN_PROMPT: &str = "Validate the open KiCad design. Check kicad_status, summarize the active PCB, run DRC, and run ERC if a schematic is open. Distinguish tool execution failures from actual design violations. Do not mutate or save anything.";
-const INSPECT_SCHEMATIC_PROMPT: &str = "Inspect a KiCad 11 schematic using schematic_hierarchy and schematic_netlist, using pagination. Run ERC when filesystem access is approved. Do not change the design.";
+const INSPECT_SCHEMATIC_PROMPT: &str = "Inspect a KiCad 11 schematic using schematic_hierarchy and schematic_netlist, using pagination. Preserve the hierarchy path_ids when recommending a target sheet for place_symbol. Run ERC when filesystem access is approved. Do not change the design.";
+const FOOTPRINT_PLACEMENT_PROMPT: &str = "Review footprint placement read-only. Inspect the board summary and paginated footprints, checking measured positions, orientations, layers, reference/value consistency, edge clearance risk, clustering, and likely assembly-access issues. Separate observed facts from recommendations. Do not mutate or save.";
+const ROUTING_REVIEW_PROMPT: &str = "Review routing read-only. Inspect board counts, nets, current selection, tracks/vias where available, and run DRC. Prioritize shorts, unconnected items, width/clearance issues, excessive vias, layer transitions, and return-path risks. Do not mutate or save.";
+const MANUFACTURING_PREFLIGHT_PROMPT: &str = "Perform a read-only manufacturing preflight. Confirm KiCad connectivity and project identity, run DRC and ERC when applicable, review board outline and footprint/net summaries, and identify blockers before generating fabrication artifacts. Distinguish verified results from checks that require human fabrication-rule review. Do not mutate, export, or save.";
 
 fn resource_result<T: serde::Serialize, E: std::fmt::Display>(result: Result<T, E>) -> String {
     result.map(|value| json(&value)).unwrap_or_else(|error| {
@@ -635,17 +674,42 @@ fn default_dry_run() -> bool {
     true
 }
 
+fn max_response_bytes() -> usize {
+    std::env::var("KICAD_MCP_MAX_OUTPUT_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64 * 1024)
+        .clamp(1_024, 1024 * 1024)
+}
+
+fn enforce_response_limit(output: String) -> Result<String, String> {
+    let limit = max_response_bytes();
+    if output.len() <= limit {
+        Ok(output)
+    } else {
+        Err(serde_json::json!({
+            "ok": false,
+            "error": "response exceeds configured byte limit; paginate or request fewer fields",
+            "limit_bytes": limit,
+        })
+        .to_string())
+    }
+}
+
 fn json<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_string_pretty(value)
-        .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }).to_string())
+    let output = serde_json::to_string_pretty(value)
+        .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }).to_string());
+    enforce_response_limit(output).unwrap_or_else(|error| error)
 }
 
 fn encode<T: serde::Serialize, E: std::fmt::Display>(
     result: Result<T, E>,
 ) -> Result<String, String> {
-    result
-        .map(|value| json(&value))
-        .map_err(|error| serde_json::json!({ "ok": false, "error": error.to_string() }).to_string())
+    let value = result.map_err(|error| {
+        serde_json::json!({ "ok": false, "error": error.to_string() }).to_string()
+    })?;
+    let output = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
+    enforce_response_limit(output)
 }
 
 fn encode_selected<T: serde::Serialize, E: std::fmt::Display>(
@@ -683,7 +747,8 @@ fn encode_selected<T: serde::Serialize, E: std::fmt::Display>(
             }
         }
     }
-    serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
+    let output = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
+    enforce_response_limit(output)
 }
 
 #[cfg(test)]
@@ -691,15 +756,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn oversized_responses_are_rejected() {
+        assert!(enforce_response_limit("x".repeat(1024 * 1024 + 1)).is_err());
+    }
+
+    #[test]
     fn disconnected_server_hides_kicad_11_tools() {
         let server = KicadMcp::new();
+        assert!(!server.tool_router.is_disabled("schematic_hierarchy"));
+        let router = server.current_tool_router();
         for name in [
             "schematic_hierarchy",
             "schematic_netlist",
             "place_symbol",
             "native_export_step",
         ] {
-            assert!(server.tool_router.is_disabled(name), "{name} was visible");
+            assert!(router.is_disabled(name), "{name} was visible");
         }
     }
 }
