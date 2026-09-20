@@ -30,13 +30,13 @@ KiCad processes API requests synchronously in its GUI event loop. The adapter th
 
 ### KiCad IPC adapter
 
-The adapter will:
+The adapter:
 
-- use protobuf definitions pinned to a tested KiCad release tag;
-- generate Rust message types at build time with `prost`;
-- exchange request/response envelopes through NNG IPC;
-- validate response tokens and map KiCad status codes to stable MCP errors;
-- reconnect safely when KiCad restarts or its token changes.
+- uses protobuf definitions pinned to tested KiCad snapshots;
+- generates Rust message types at build time with `prost`;
+- exchanges request/response envelopes through NNG IPC;
+- validates response types, rotates tokens, and maps KiCad status codes to stable MCP errors;
+- reconnects safe read calls after transient failures while never retrying mutations.
 
 ### CLI adapter
 

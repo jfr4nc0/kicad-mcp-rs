@@ -1,4 +1,10 @@
 /target/
+/dist/
+.history/
+*-drc.json
+*-erc.json
+*.kicad_prl
+~*.lck
 .env
 .env.*
 !.env.example

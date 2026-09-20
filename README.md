@@ -1,105 +1,126 @@
 # kicad-mcp-rs
 
-A fast, local-first Model Context Protocol (MCP) server for KiCad, written in Rust.
+A local-first Model Context Protocol server for KiCad, written in Rust. It talks to KiCad through the official Protobuf-over-NNG IPC API; it does not rewrite an open design as text.
 
-> Early scaffold: the server currently exposes safe discovery/status tools. It does **not** modify KiCad projects yet. See [ROADMAP.md](docs/ROADMAP.md).
+## Status
 
-## Why
+Version `0.2.0` implements the M0–M6 surface. KiCad 10.0.6 is the primary target. KiCad 11 support is built from a pinned development schema and remains preview until tested against a released KiCad 11 build. See [COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
-KiCad provides an official language-agnostic IPC API, but no official KiCad-maintained MCP server. This project aims to expose a small, auditable tool surface to AI agents without parsing or rewriting KiCad files behind the application's back.
+## Safety model
 
-## Design principles
+- MCP uses stdio; diagnostics use stderr only.
+- Reads are bounded and paginated.
+- `KICAD_API_TOKEN` is never returned or logged.
+- Mutations require both `KICAD_MCP_ALLOW_WRITE=true` and `KICAD_MCP_PROJECT_ROOT`.
+- Update/delete operations require a content revision.
+- Mutation tools default to dry-run and return structured receipts.
+- Mutations never save automatically; `save_active_board` is explicit.
+- DRC/ERC and exports use argument arrays, not a shell, and paths are confined to the project root.
 
-- Use KiCad's official IPC API (Protobuf over NNG), not ad-hoc file mutation.
-- Keep one serialized connection to the running KiCad instance.
-- Read-only by default; mutation requires explicit opt-in.
-- Return structured, bounded results suitable for agent context windows.
-- Validate edits with KiCad and provide clear revision/precondition failures.
-- Never expose `KICAD_API_TOKEN` in logs or MCP results.
-- Keep the default deployment local over MCP stdio.
+## Tool surface
 
-## Current tools
+Inspect and validate:
 
-- `kicad_status`: discovers the IPC socket and reports safety state without revealing the API token.
-- `server_info`: reports server version, transport, and implementation scope.
+- `kicad_status`, `server_info`, `get_active_project`, `get_board_summary`
+- `list_footprints`, `get_footprint`, `list_nets`, `get_selection`
+- `run_drc`, `run_erc`, `export_board`
 
-## Build and run
+PCB mutation:
 
-Requirements:
+- `move_footprint`, `set_footprint_property`
+- `create_track`, `update_track`, `create_via`, `delete_item`
+- `save_active_board`
 
-- Rust 1.88+
-- KiCad 10+ (KiCad 10 support is the first target)
+KiCad 11 preview (hidden unless KiCad 11+ is detected at startup):
+
+- `schematic_hierarchy`, `schematic_netlist`, `place_symbol`
+- `native_export_step`
+
+The server also exposes bounded MCP resources for project/board/DRC/capabilities/safety state and conservative workflow prompts.
+
+## Requirements
+
+- Rust 1.88+ to build from source.
+- KiCad 10+ with the IPC API enabled.
+- A running PCB Editor for KiCad 10.
+- `kicad-cli` for DRC, ERC, and KiCad 10 exports.
+
+## Build
 
 ```bash
-cargo build --release
-RUST_LOG=info cargo run
+cargo build --release --locked
+cargo test --all-features --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
 ```
 
-The process speaks MCP over stdin/stdout. Logs are emitted only to stderr.
+Probe a KiCad-launched or explicitly configured IPC connection:
 
-Example client configuration:
-
-```json
-{
-  "mcpServers": {
-    "kicad": {
-      "command": "/absolute/path/to/kicad-mcp-rs/target/release/kicad-mcp"
-    }
-  }
-}
+```bash
+target/release/kicad-mcp --probe
 ```
 
-For Hermes Agent:
+Run as an MCP stdio server:
 
-```yaml
-mcp_servers:
-  kicad:
-    command: "/absolute/path/to/kicad-mcp-rs/target/release/kicad-mcp"
-    timeout: 30
+```bash
+RUST_LOG=info target/release/kicad-mcp
 ```
 
-## KiCad 10 constraints
+## Configuration
 
-According to KiCad's official IPC documentation:
+| Variable | Default | Purpose |
+|---|---|---|
+| `KICAD_API_SOCKET` | auto-discovered | KiCad NNG socket or named-pipe endpoint |
+| `KICAD_API_TOKEN` | empty | KiCad instance authentication token |
+| `KICAD_MCP_ALLOW_WRITE` | `false` | Explicit mutation opt-in |
+| `KICAD_MCP_PROJECT_ROOT` | unset | Canonical path allowlist for design and output files |
+| `KICAD_MCP_MAX_PAGE_SIZE` | bounded internal default | Maximum items per page |
+| `KICAD_MCP_MAX_OUTPUT_BYTES` | bounded internal default | Maximum CLI output returned |
+| `KICAD_CLI` | discovered | Explicit `kicad-cli` path |
 
-- KiCad 9 and 10 require a running GUI instance.
-- IPC plugins in KiCad 9 and 10 are limited to PCB Editor.
-- Headless IPC and export/plot support arrive in KiCad 11; for KiCad 10, export automation must use `kicad-cli`.
-- Schematic Editor IPC plugin support arrives in KiCad 11.
+Client examples: [CLIENTS.md](docs/CLIENTS.md).
 
-The MCP capability list will reflect the connected KiCad version instead of advertising unsupported tools.
+## KiCad plugin action
 
-## Architecture
+`plugin/plugin.json` conforms to KiCad's official IPC plugin schema. Release archives place it beside `bin/kicad-mcp`; installing that directory under KiCad's versioned `plugins` directory adds a probe action. The action checks connectivity and exits; MCP clients normally launch the same binary directly over stdio.
 
-```text
-Agent / MCP client
-        |
-        | MCP stdio (JSON-RPC)
-        v
-kicad-mcp-rs
-  - tool router
-  - capability and safety policy
-  - serialized command queue
-  - KiCad IPC adapter
-        |
-        | Protobuf envelopes over NNG IPC
-        v
-Running KiCad instance
+## KiCad 11 preview and headless mode
+
+KiCad 11 development schemas add schematic IPC and native export jobs. These tools are compiled in but omitted from tool/resource/prompt discovery unless the connected KiCad reports major version 11 or newer.
+
+On KiCad 11, `scripts/run-headless.sh` supervises the official headless API server and this MCP process together:
+
+```bash
+KICAD_CLI=/path/to/kicad-cli \
+KICAD_MCP_BIN=/path/to/kicad-mcp \
+  scripts/run-headless.sh /absolute/path/project.kicad_pro
 ```
 
-See [ARCHITECTURE.md](docs/ARCHITECTURE.md) and [ROADMAP.md](docs/ROADMAP.md).
+The wrapper starts `kicad-cli api-server ... --socket ...`, waits for the NNG socket, exports its path, runs the stdio MCP server, and terminates the API server when MCP exits. Write mode remains disabled unless `KICAD_MCP_ALLOW_WRITE=true` is explicitly supplied. This path is implementation-complete but remains unverified until a compatible KiCad 11 binary is available.
 
-## Upstream references
+## Packaging
 
-- KiCad IPC API overview: https://dev-docs.kicad.org/en/apis-and-binding/ipc-api/index.html
-- Add-on developer documentation: https://dev-docs.kicad.org/en/apis-and-binding/ipc-api/for-addon-developers/
-- KiCad source mirror and protobuf definitions: https://github.com/KiCad/kicad-source-mirror/tree/10.0.6/api/proto
-- Official MCP Rust SDK: https://github.com/modelcontextprotocol/rust-sdk
+Release automation produces native archives, CycloneDX SBOMs, SHA-256 checksums, and GitHub build-provenance attestations. To package locally:
 
-## Safety
+```bash
+cargo install cargo-cyclonedx --locked
+bash scripts/package-release.sh
+```
 
-Generated PCB changes can be electrically or physically wrong. This project is not a substitute for ERC/DRC, datasheet review, design review, or engineering judgment. Never manufacture safety-critical hardware from unreviewed agent output.
+## Architecture and provenance
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Threat model](docs/THREAT_MODEL.md)
+- [Roadmap and acceptance criteria](docs/ROADMAP.md)
+- [Executed verification record](docs/VERIFICATION.md)
+- [Protobuf provenance](docs/PROTOBUF_PROVENANCE.md)
+
+Upstream references:
+
+- https://dev-docs.kicad.org/en/apis-and-binding/ipc-api/index.html
+- https://dev-docs.kicad.org/en/apis-and-binding/ipc-api/for-addon-developers/
+- https://github.com/KiCad/kicad-source-mirror/tree/10.0.6/api/proto
+- https://github.com/modelcontextprotocol/rust-sdk
 
 ## License
 
-GPL-3.0-or-later. This choice is compatible with the official KiCad protobuf definitions that the IPC adapter will consume.
+GPL-3.0-or-later.

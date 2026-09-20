@@ -1,0 +1,19 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "org.jfr4nc0.kicad-mcp",
+  "name": "KiCad MCP",
+  "description": "Probe the local KiCad IPC connection used by the KiCad MCP server.",
+  "runtime": {
+    "type": "exec"
+  },
+  "actions": [
+    {
+      "identifier": "probe",
+      "name": "Probe MCP connection",
+      "description": "Check IPC connectivity and print version and safety capabilities without revealing the API token.",
+      "show-button": false,
+      "scopes": ["pcb", "schematic"],
+      "entrypoint": "bin/kicad-mcp --probe"
+    }
+  ]
+}
